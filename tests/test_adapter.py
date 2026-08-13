@@ -401,6 +401,23 @@ class TestAdapterInit:
         adapter._ddp_method.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_ddp_uses_heartbeat_to_detect_silent_disconnects(self):
+        adapter = _make_adapter()
+        ws = MagicMock()
+        ws._response.url = "wss://rc.example.com/websocket"
+        adapter._session = MagicMock()
+        adapter._session.ws_connect = AsyncMock(return_value=ws)
+        adapter._ddp_send = AsyncMock()
+        adapter._ddp_method = AsyncMock()
+        adapter._ddp_sub = AsyncMock()
+
+        await adapter._ws_connect_and_listen()
+
+        adapter._session.ws_connect.assert_awaited_once_with(
+            "wss://rc.example.com/websocket", heartbeat=30
+        )
+
+    @pytest.mark.asyncio
     async def test_attachment_download_rejects_unsafe_path_segments_before_network(self):
         adapter = _make_adapter()
         response = MagicMock(status=404)

@@ -95,7 +95,9 @@ class DdpTransportMixin:
         ws_url = websocket_url(self._base_url)
         logger.info("Rocket.Chat: DDP connecting to %s", ws_url)
 
-        self._ws = await self._session.ws_connect(ws_url, heartbeat=None)
+        # A heartbeat turns silent proxy/network drops into an exception so the
+        # existing reconnect loop can re-authenticate and re-subscribe.
+        self._ws = await self._session.ws_connect(ws_url, heartbeat=30)
         response = getattr(self._ws, "_response", None)
         final_url = getattr(response, "url", None)
         if not websocket_endpoint_matches(ws_url, final_url):
