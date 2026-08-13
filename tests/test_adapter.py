@@ -969,6 +969,11 @@ class TestHandleMessage:
         adapter._download_attachments.assert_not_awaited()
         adapter._fetch_thread_context.assert_not_awaited()
         adapter.handle_message.assert_not_awaited()
+        with adapter._inbound_ledger._connect() as connection:
+            row_count = connection.execute(
+                "SELECT COUNT(*) FROM inbound_events"
+            ).fetchone()[0]
+        assert row_count == 0
 
     @pytest.mark.asyncio
     async def test_own_message_ignored(self):
@@ -1033,6 +1038,46 @@ class TestHandleMessage:
 
         restarted.handle_message.assert_not_awaited()
 
+    def test_old_processed_events_are_pruned_without_expiring_active_claims(self):
+        adapter = _wired_adapter()
+        ledger = adapter._inbound_ledger
+        assert ledger.claim("old-room", "old-processed") == "claimed"
+        assert ledger.complete("old-room", "old-processed") is True
+        assert ledger.claim("active-room", "active-processing") == "claimed"
+        with ledger._connect() as connection:
+            connection.execute(
+                "UPDATE inbound_events SET completed_at = 0 "
+                "WHERE message_id = 'old-processed'"
+            )
+
+        assert ledger.claim("new-room", "new-message") == "claimed"
+
+        with ledger._connect() as connection:
+            message_ids = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT message_id FROM inbound_events"
+                )
+            }
+        assert "old-processed" not in message_ids
+        assert "active-processing" in message_ids
+
+    def test_processed_retention_delete_uses_covering_index(self):
+        ledger = _wired_adapter()._inbound_ledger
+        with ledger._connect() as connection:
+            plan = " ".join(
+                str(column)
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN DELETE FROM inbound_events "
+                    "WHERE platform = 'rocketchat' "
+                    "AND status = 'processed' AND completed_at < ?",
+                    (0,),
+                )
+                for column in row
+            )
+
+        assert "USING INDEX inbound_events_retention_idx" in plan
+
     @pytest.mark.asyncio
     async def test_same_post_id_in_different_rooms_is_not_duplicate(self):
         adapter = _wired_adapter()
@@ -1054,7 +1099,7 @@ class TestHandleMessage:
         restarted.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_processing_failure_releases_post_for_redelivery(self):
+    async def test_processing_failure_keeps_post_deduplicated(self):
         first = _wired_adapter()
         await first._handle_message(_post())
         event = first.handle_message.await_args.args[0]
@@ -1063,7 +1108,7 @@ class TestHandleMessage:
         restarted = _wired_adapter()
         await restarted._handle_message(_post())
 
-        restarted.handle_message.assert_awaited_once()
+        restarted.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_failed_dispatch_releases_durable_claim_for_redelivery(self):
@@ -1078,6 +1123,108 @@ class TestHandleMessage:
         await adapter._handle_message(_post())
 
         assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_active_session_inline_command_does_not_orphan_claim(self):
+        adapter = _wired_adapter()
+        adapter.handle_message = RocketchatAdapter.handle_message.__get__(adapter)
+        adapter._message_handler = AsyncMock(return_value=None)
+        source = SessionSource(
+            platform=Platform("rocketchat"),
+            chat_id="room1",
+            chat_type="dm",
+            user_id="u1",
+            user_name="alice",
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._session_tasks[session_key] = asyncio.current_task()
+
+        await adapter._handle_message(_post(msg="/status", post_id="pstatus"))
+
+        with adapter._inbound_ledger._connect() as connection:
+            status = connection.execute(
+                "SELECT status FROM inbound_events WHERE message_id = 'pstatus'"
+            ).fetchone()[0]
+        assert status == "processed"
+
+    @pytest.mark.asyncio
+    async def test_merged_queued_messages_do_not_orphan_claims(self):
+        adapter = _wired_adapter()
+        adapter.handle_message = RocketchatAdapter.handle_message.__get__(adapter)
+        adapter._message_handler = AsyncMock(return_value=None)
+        adapter._is_queue_text_debounce_candidate = MagicMock(return_value=False)
+        source = SessionSource(
+            platform=Platform("rocketchat"),
+            chat_id="room1",
+            chat_type="dm",
+            user_id="u1",
+            user_name="alice",
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._session_tasks[session_key] = asyncio.current_task()
+
+        await adapter._handle_message(_post(msg="one", post_id="p1"))
+        await adapter._handle_message(_post(msg="two", post_id="p2"))
+
+        assert adapter._pending_messages[session_key].text == "one\ntwo"
+        with adapter._inbound_ledger._connect() as connection:
+            statuses = dict(
+                connection.execute(
+                    "SELECT message_id, status FROM inbound_events "
+                    "WHERE message_id IN ('p1', 'p2')"
+                )
+            )
+        assert statuses == {"p1": "processed", "p2": "processed"}
+
+    @pytest.mark.asyncio
+    async def test_merged_photo_messages_do_not_orphan_claims(self):
+        adapter = _wired_adapter()
+        adapter.handle_message = RocketchatAdapter.handle_message.__get__(adapter)
+        adapter._message_handler = AsyncMock(return_value=None)
+        adapter._download_attachments = AsyncMock(
+            side_effect=lambda post: (["/tmp/photo.jpg"], ["image/jpeg"])
+        )
+        source = SessionSource(
+            platform=Platform("rocketchat"),
+            chat_id="room1",
+            chat_type="dm",
+            user_id="u1",
+            user_name="alice",
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._session_tasks[session_key] = asyncio.current_task()
+
+        for post_id in ("photo1", "photo2", "photo3"):
+            await adapter._handle_message(_post(msg="", post_id=post_id))
+
+        assert len(adapter._pending_messages[session_key].media_urls) == 3
+        with adapter._inbound_ledger._connect() as connection:
+            statuses = dict(
+                connection.execute(
+                    "SELECT message_id, status FROM inbound_events "
+                    "WHERE message_id IN ('photo1', 'photo2', 'photo3')"
+                )
+            )
+        assert statuses == {
+            "photo1": "processed",
+            "photo2": "processed",
+            "photo3": "processed",
+        }
 
     @pytest.mark.asyncio
     async def test_persistence_failure_fails_closed_before_dispatch(self, tmp_path):
@@ -1095,6 +1242,11 @@ class TestHandleMessage:
         adapter = _wired_adapter(room_type="channel")
         await adapter._handle_message(_post(t="uj"))
         adapter.handle_message.assert_not_awaited()
+        with adapter._inbound_ledger._connect() as connection:
+            row_count = connection.execute(
+                "SELECT COUNT(*) FROM inbound_events"
+            ).fetchone()[0]
+        assert row_count == 0
 
     @pytest.mark.asyncio
     async def test_dm_dispatched_without_mention(self):
@@ -1379,6 +1531,9 @@ class TestHandleMessage:
         monkeypatch.setenv("ROCKETCHAT_FORWARDED_SLASH_COMMANDS", "giphy")
         adapter._api_post = AsyncMock(return_value={"success": True})
         await adapter._handle_message(_post(msg="/giphy cat"))
+        adapter._dedup = MagicMock()
+        adapter._dedup.is_duplicate.return_value = False
+        await adapter._handle_message(_post(msg="/giphy cat"))
         adapter._api_post.assert_awaited_once()
         assert adapter._api_post.await_args[0][0] == "commands.run"
         adapter.handle_message.assert_not_awaited()
@@ -1458,6 +1613,51 @@ class TestHandleMessage:
         adapter._download_attachments.assert_not_awaited()
         adapter._fetch_thread_context.assert_not_awaited()
         adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_dm_pairing_side_effect_is_durably_deduplicated(self):
+        pairing_store = MagicMock()
+        pairing_store._is_rate_limited.return_value = False
+        pairing_store.generate_code.return_value = "PAIR123"
+        pairing_adapter = MagicMock()
+        pairing_adapter.send = AsyncMock()
+
+        class Runner:
+            session_store = None
+
+            def _get_unauthorized_dm_behavior(self, platform):
+                return "pair"
+
+            def _is_user_authorized(self, source):
+                return False
+
+            async def dispatch(self, event):
+                return None
+
+        runner = Runner()
+        runner.adapters = {Platform("rocketchat"): pairing_adapter}
+        runner.pairing_store = pairing_store
+
+        first = _wired_adapter(room_type="dm")
+        first._inbound_authorization_checker = None
+        first._message_handler = runner.dispatch
+        await first._handle_message(_post(post_id="pairing-post"))
+
+        restarted = _wired_adapter(room_type="dm")
+        restarted._inbound_authorization_checker = None
+        restarted._message_handler = runner.dispatch
+        await restarted._handle_message(_post(post_id="pairing-post"))
+
+        pairing_store.generate_code.assert_called_once_with(
+            "rocketchat", "u1", "alice"
+        )
+        pairing_adapter.send.assert_awaited_once()
+        with first._inbound_ledger._connect() as connection:
+            status = connection.execute(
+                "SELECT status FROM inbound_events "
+                "WHERE message_id = 'pairing-post'"
+            ).fetchone()[0]
+        assert status == "processed"
 
     @pytest.mark.asyncio
     async def test_title_sync_is_default_off_and_requires_trusted_writer(

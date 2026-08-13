@@ -7,7 +7,12 @@ and currently carries these operational fixes on top of upstream:
 - **Durable inbound idempotency.** Rocket.Chat events are claimed by room and
   post ID in a profile-scoped SQLite ledger. Replayed DDP events are therefore
   dropped even after the in-memory TTL expires or the Hermes gateway restarts;
-  failed processing releases the claim so Rocket.Chat can retry it.
+  only failures before Hermes accepts an event release the claim for retry.
+  Accepted inline, queued, merged, and background events remain deduplicated
+  because tool side effects may already exist even when later processing or
+  response delivery fails. Ignored events are released, and completed-event
+  IDs are retained for 90 days with indexed retention cleanup. Unauthorized-DM
+  pairing responses are treated as adapter side effects and remain deduplicated.
 - **WebSocket heartbeat.** The DDP connection uses a 30-second aiohttp
   heartbeat so silent half-open connections trigger the existing reconnect and
   re-subscription path. This addresses

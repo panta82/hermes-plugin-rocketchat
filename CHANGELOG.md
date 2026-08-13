@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.2
+
+- Mark events processed at the common successful Hermes handoff boundary so
+  active-session commands and merged/queued messages cannot leave orphaned
+  claims. Accepted events remain deduplicated after terminal failure because
+  they may already have performed non-idempotent tool calls; only pre-handoff
+  dispatch failures are retried.
+- Release claims for ignored and non-admitted events so unrelated Rocket.Chat
+  traffic does not accumulate in the ledger. Adapter-handled write effects
+  remain deduplicated, including unauthorized-DM pairing responses.
+- Prune only completed-event IDs older than 90 days. Active processing claims
+  never expire automatically, so long-running turns cannot overlap a replay;
+  an index keeps retention cleanup bounded to matching completed rows.
+
 ## 1.4.1
 
 - Add a profile-scoped SQLite inbound-event ledger keyed by Rocket.Chat room

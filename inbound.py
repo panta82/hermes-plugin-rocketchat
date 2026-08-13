@@ -36,6 +36,13 @@ _INBOUND_MESSAGE_MAX_CHARS = 100_000
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
+class _AdmissionSideEffect:
+    """Sentinel type for rejected events that already caused an adapter write."""
+
+
+_ADMISSION_SIDE_EFFECT = _AdmissionSideEffect()
+
+
 def _thread_context_budget() -> int:
     try:
         value = int(
@@ -185,11 +192,11 @@ def _sanitize_inbound_message(value: Any) -> str:
 class InboundMixin:
     """Inbound handling of :class:`~.adapter.RocketchatAdapter`."""
 
-    async def _offer_central_pairing(self, owner: Any, event: MessageEvent) -> None:
+    async def _offer_central_pairing(self, owner: Any, event: MessageEvent) -> bool:
         """Mirror GatewayRunner's rejected-DM pairing branch without dispatching."""
         source = event.source
         if source.chat_type != "dm" or source.user_id is None:
-            return
+            return False
         behavior = getattr(owner, "_get_unauthorized_dm_behavior", None)
         pairing_store = getattr(owner, "pairing_store", None)
         adapters = getattr(owner, "adapters", None)
@@ -198,19 +205,21 @@ class InboundMixin:
             or pairing_store is None
             or not isinstance(adapters, dict)
         ):
-            return
+            return False
+        side_effect_attempted = False
         try:
             if behavior(source.platform) != "pair":
-                return
+                return False
             platform_name = source.platform.value if source.platform else "unknown"
             if pairing_store._is_rate_limited(platform_name, source.user_id):
-                return
+                return False
+            side_effect_attempted = True
             code = pairing_store.generate_code(
                 platform_name, source.user_id, source.user_name or ""
             )
             adapter = adapters.get(source.platform)
             if adapter is None:
-                return
+                return True
             if code:
                 await adapter.send(
                     source.chat_id,
@@ -225,15 +234,17 @@ class InboundMixin:
                     "Too many pairing requests right now~ Please try again later!",
                 )
                 pairing_store._record_rate_limit(platform_name, source.user_id)
+            return True
         except Exception as exc:
             logger.error(
                 "Rocket.Chat central pairing preflight failed (%s)",
                 type(exc).__name__,
             )
+            return side_effect_attempted
 
     async def _admit_inbound_event(
         self, event: MessageEvent, *, offer_pairing: bool = True
-    ) -> MessageEvent | None:
+    ) -> MessageEvent | _AdmissionSideEffect | None:
         """Run hook + gateway authorization exactly once before adapter effects.
 
         Current Hermes exposes only one combined private handler that performs
@@ -301,7 +312,8 @@ class InboundMixin:
             return None
         if not authorized:
             if offer_pairing and handler_owner is not None:
-                await self._offer_central_pairing(handler_owner, admitted)
+                if await self._offer_central_pairing(handler_owner, admitted):
+                    return _ADMISSION_SIDE_EFFECT
             return None
         return dataclasses.replace(admitted, internal=True)
 
@@ -370,16 +382,18 @@ class InboundMixin:
             )
             raise
         else:
-            # BasePlatformAdapter.handle_message() schedules agent work and
-            # returns immediately. Keep dispatched events in `processing` until
-            # on_processing_complete() records the actual outcome. Filtered or
-            # adapter-handled events have no later callback, so finalize those
-            # here.
-            if dispatched:
-                return
-            await asyncio.to_thread(
-                self._inbound_ledger.complete, room_id, post_id
+            # BasePlatformAdapter.handle_message() may schedule background
+            # work, handle an active-session command inline, or merge this post
+            # into a queued event whose message_id belongs to an earlier post.
+            # A successful return is therefore the only common handoff boundary
+            # for every path. Mark it processed here; retry only when handoff
+            # raises before Hermes accepts the event.
+            ledger_action = (
+                self._inbound_ledger.complete
+                if dispatched is not None
+                else self._inbound_ledger.release
             )
+            await asyncio.to_thread(ledger_action, room_id, post_id)
 
     async def _handle_claimed_message(
         self,
@@ -576,6 +590,8 @@ class InboundMixin:
                 message_id=post_id,
             )
         )
+        if admitted is _ADMISSION_SIDE_EFFECT:
+            return False
         if admitted is None:
             logger.warning("Dropping non-admitted Rocket.Chat message before effects")
             return
@@ -641,7 +657,7 @@ class InboundMixin:
                                 "Rocket.Chat: routed allowlisted command %s to RC",
                                 cmd_token,
                             )
-                            return  # RC handled it
+                            return False  # RC handled it; retain durable dedup
                 break  # tried one text, fall through to agent
 
         # If we found and tried to route a / command, replace message_text
@@ -1165,17 +1181,6 @@ class InboundMixin:
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the 👀 reaction for ✅ (success) or ❌ (failure)."""
         message_id = event.message_id
-        room_id = event.source.chat_id if event.source else None
-        if message_id and room_id:
-            if outcome == ProcessingOutcome.FAILURE:
-                self._dedup.discard(f"{room_id}:{message_id}")
-                await asyncio.to_thread(
-                    self._inbound_ledger.release, room_id, message_id
-                )
-            else:
-                await asyncio.to_thread(
-                    self._inbound_ledger.complete, room_id, message_id
-                )
         if not self._reactions_enabled():
             return
         if not message_id:

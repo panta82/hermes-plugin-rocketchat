@@ -14,6 +14,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 ClaimResult = Literal["claimed", "duplicate", "error"]
+_PROCESSED_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
 
 class InboundEventLedger:
@@ -45,6 +46,12 @@ class InboundEventLedger:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS inbound_events_retention_idx
+            ON inbound_events (platform, status, completed_at)
+            """
+        )
         return connection
 
     def claim(self, room_id: str, message_id: str) -> ClaimResult:
@@ -53,6 +60,15 @@ class InboundEventLedger:
         try:
             with closing(self._connect()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    DELETE FROM inbound_events
+                    WHERE platform = 'rocketchat'
+                      AND status = 'processed'
+                      AND completed_at < ?
+                    """,
+                    (now - _PROCESSED_RETENTION_SECONDS,),
+                )
                 row = connection.execute(
                     """
                     SELECT status, claimed_at
