@@ -325,12 +325,73 @@ class InboundMixin:
         post_id = post.get("_id", "")
         if not is_valid_server_identifier(post_id):
             return
-        if self._dedup.is_duplicate(post_id):
-            return
 
         room_id = post.get("rid", "")
         if not is_valid_server_identifier(room_id):
             return
+
+        dedup_key = f"{room_id}:{post_id}"
+        if self._dedup.is_duplicate(dedup_key):
+            logger.info(
+                "Rocket.Chat: dropped in-memory duplicate post_id=%s rid=%s",
+                post_id,
+                room_id,
+            )
+            return
+        claim = await asyncio.to_thread(
+            self._inbound_ledger.claim, room_id, post_id
+        )
+        if claim != "claimed":
+            if claim == "error":
+                self._dedup.discard(dedup_key)
+            logger.info(
+                "Rocket.Chat: dropped durable inbound event result=%s post_id=%s rid=%s tmid=%s sender_id=%s",
+                claim,
+                post_id,
+                room_id,
+                post.get("tmid"),
+                sender_id,
+            )
+            return
+
+        try:
+            dispatched = await self._handle_claimed_message(
+                post,
+                sender=sender,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                post_id=post_id,
+                room_id=room_id,
+            )
+        except BaseException:
+            self._dedup.discard(dedup_key)
+            await asyncio.to_thread(
+                self._inbound_ledger.release, room_id, post_id
+            )
+            raise
+        else:
+            # BasePlatformAdapter.handle_message() schedules agent work and
+            # returns immediately. Keep dispatched events in `processing` until
+            # on_processing_complete() records the actual outcome. Filtered or
+            # adapter-handled events have no later callback, so finalize those
+            # here.
+            if dispatched:
+                return
+            await asyncio.to_thread(
+                self._inbound_ledger.complete, room_id, post_id
+            )
+
+    async def _handle_claimed_message(
+        self,
+        post: Dict[str, Any],
+        *,
+        sender: Dict[str, Any],
+        sender_id: str,
+        sender_name: str,
+        post_id: str,
+        room_id: str,
+    ) -> bool | None:
+        """Process one durably claimed Rocket.Chat event."""
 
         # Look up room type lazily; cache forever.
         chat_type = self._room_type_cache.get(room_id)
@@ -374,6 +435,7 @@ class InboundMixin:
                     if admitted is not None:
                         self._last_topic[room_id] = topic_text
                         await self.handle_message(admitted)
+                        return True
             return  # All other system messages: skip
 
         raw_message_text = post.get("msg", "")
@@ -670,6 +732,7 @@ class InboundMixin:
         )
 
         await self.handle_message(msg_event)
+        return True
 
     async def _resolve_room_type(self, room_id: str) -> str:
         """Look up a room's type via REST. Defaults to 'channel' on failure."""
@@ -1101,9 +1164,20 @@ class InboundMixin:
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the 👀 reaction for ✅ (success) or ❌ (failure)."""
+        message_id = event.message_id
+        room_id = event.source.chat_id if event.source else None
+        if message_id and room_id:
+            if outcome == ProcessingOutcome.FAILURE:
+                self._dedup.discard(f"{room_id}:{message_id}")
+                await asyncio.to_thread(
+                    self._inbound_ledger.release, room_id, message_id
+                )
+            else:
+                await asyncio.to_thread(
+                    self._inbound_ledger.complete, room_id, message_id
+                )
         if not self._reactions_enabled():
             return
-        message_id = event.message_id
         if not message_id:
             return
         await self._remove_reaction(message_id, ":eyes:")

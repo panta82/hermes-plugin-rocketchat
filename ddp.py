@@ -165,5 +165,15 @@ class DdpTransportMixin:
             args = fields.get("args") or []
             if not args:
                 return
+            post = args[0] if isinstance(args[0], dict) else {}
+            sender = post.get("u") if isinstance(post.get("u"), dict) else {}
+            logger.info(
+                "Rocket.Chat: DDP inbound event=%s post_id=%s rid=%s tmid=%s sender_id=%s",
+                kind,
+                post.get("_id"),
+                post.get("rid"),
+                post.get("tmid"),
+                sender.get("_id"),
+            )
             await self._handle_message(args[0])
             return

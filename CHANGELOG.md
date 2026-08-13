@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.1
+
+- Add a profile-scoped SQLite inbound-event ledger keyed by Rocket.Chat room
+  and post ID, preventing DDP update/replay events from starting another agent
+  turn after the in-memory dedup TTL expires or the gateway restarts.
+- Fail closed when the durable claim cannot be written and release an
+  in-process claim when dispatch or processing fails, allowing a later
+  redelivery. Claims never expire automatically, so a long-running turn cannot
+  admit the same Rocket.Chat event twice.
+- Log Rocket.Chat DDP and dedup correlation fields (`post_id`, `rid`, `tmid`,
+  sender ID) without message content.
+
 ## [1.4.0] - 2026-07-23
 
 ### Added

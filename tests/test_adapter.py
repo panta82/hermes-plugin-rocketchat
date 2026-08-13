@@ -5,6 +5,7 @@ adapter of PR #30463 (PAT-only auth, reply_mode, topic sync, slash
 command routing).
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -77,7 +78,8 @@ websocket_url = _plugin_helpers.websocket_url
 
 
 @pytest.fixture(autouse=True)
-def _clean_rocketchat_env(monkeypatch):
+def _clean_rocketchat_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     for key in list(os.environ):
         if key.startswith("ROCKETCHAT_"):
             monkeypatch.delenv(key, raising=False)
@@ -980,6 +982,113 @@ class TestHandleMessage:
         await adapter._handle_message(_post())
         await adapter._handle_message(_post())
         assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_ignored_after_memory_dedup_expires(self):
+        adapter = _wired_adapter()
+        await adapter._handle_message(_post())
+
+        adapter._dedup = MagicMock()
+        adapter._dedup.is_duplicate.return_value = False
+        await adapter._handle_message(_post())
+
+        assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_ignored_after_adapter_restart(self):
+        first = _wired_adapter()
+        await first._handle_message(_post())
+
+        restarted = _wired_adapter()
+        await restarted._handle_message(_post())
+
+        first.handle_message.assert_awaited_once()
+        restarted.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_adapter_claims_dispatch_exactly_once(self):
+        first = _wired_adapter()
+        second = _wired_adapter()
+
+        await asyncio.gather(
+            first._handle_message(_post()),
+            second._handle_message(_post()),
+        )
+
+        assert (
+            first.handle_message.await_count + second.handle_message.await_count
+        ) == 1
+
+    @pytest.mark.asyncio
+    async def test_in_progress_claim_does_not_expire_during_long_turn(self):
+        first = _wired_adapter()
+        await first._handle_message(_post())
+
+        with first._inbound_ledger._connect() as connection:
+            connection.execute(
+                "UPDATE inbound_events SET claimed_at = 0"
+            )
+        restarted = _wired_adapter()
+        await restarted._handle_message(_post())
+
+        restarted.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_post_id_in_different_rooms_is_not_duplicate(self):
+        adapter = _wired_adapter()
+        await adapter._handle_message(_post(rid="room1"))
+        await adapter._handle_message(_post(rid="room2"))
+
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_processing_completion_keeps_post_deduplicated(self):
+        first = _wired_adapter()
+        await first._handle_message(_post())
+        event = first.handle_message.await_args.args[0]
+        await first.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        restarted = _wired_adapter()
+        await restarted._handle_message(_post())
+
+        restarted.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_processing_failure_releases_post_for_redelivery(self):
+        first = _wired_adapter()
+        await first._handle_message(_post())
+        event = first.handle_message.await_args.args[0]
+        await first.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        restarted = _wired_adapter()
+        await restarted._handle_message(_post())
+
+        restarted.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_releases_durable_claim_for_redelivery(self):
+        adapter = _wired_adapter()
+        adapter.handle_message = AsyncMock(
+            side_effect=[RuntimeError("dispatch failed"), None]
+        )
+
+        with pytest.raises(RuntimeError, match="dispatch failed"):
+            await adapter._handle_message(_post())
+
+        await adapter._handle_message(_post())
+
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_persistence_failure_fails_closed_before_dispatch(self, tmp_path):
+        adapter = _wired_adapter()
+        invalid_parent = tmp_path / "not-a-directory"
+        invalid_parent.write_text("file")
+        adapter._inbound_ledger._path = invalid_parent / "ledger.db"
+
+        await adapter._handle_message(_post())
+
+        adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_system_message_skipped(self):

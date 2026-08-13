@@ -28,6 +28,7 @@ from .helpers import (
     validate_auth_config,
 )
 from .inbound import InboundMixin
+from .inbound_ledger import InboundEventLedger
 from .media import MediaMixin
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class RocketchatAdapter(
 
         # Dedup cache.
         self._dedup = MessageDeduplicator()
+        self._inbound_ledger = InboundEventLedger()
 
         # One-shot bot-to-bot tasks. Replies in these DM rooms carry a
         # terminal result envelope so they cannot start another agent turn.
