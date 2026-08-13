@@ -1,3 +1,28 @@
+# panta82 fork
+
+This fork tracks
+[`HalfbitStudio/hermes-plugin-rocketchat`](https://github.com/HalfbitStudio/hermes-plugin-rocketchat)
+and currently carries these operational fixes on top of upstream:
+
+- **Durable inbound idempotency.** Rocket.Chat events are claimed by room and
+  post ID in a profile-scoped SQLite ledger. Replayed DDP events are therefore
+  dropped even after the in-memory TTL expires or the Hermes gateway restarts;
+  failed processing releases the claim so Rocket.Chat can retry it.
+- **WebSocket heartbeat.** The DDP connection uses a 30-second aiohttp
+  heartbeat so silent half-open connections trigger the existing reconnect and
+  re-subscription path. This addresses
+  [upstream issue #3](https://github.com/HalfbitStudio/hermes-plugin-rocketchat/issues/3).
+
+Install this fork with:
+
+```bash
+hermes plugins install panta82/hermes-plugin-rocketchat
+```
+
+The upstream README follows below.
+
+---
+
 # Rocket.Chat Plugin for Hermes Agent
 
 Connects Hermes Agent to a self-hosted Rocket.Chat instance via REST API v1 (outbound) and DDP WebSocket (inbound). Ships as a standalone plugin — zero changes to Hermes core files, no extra Python dependencies (uses `aiohttp`, already shipped with Hermes).
