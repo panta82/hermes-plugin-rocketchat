@@ -744,7 +744,6 @@ class InboundMixin:
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,
             channel_prompt=channel_prompt,
-            internal=admitted.internal,
         )
 
         await self.handle_message(msg_event)
